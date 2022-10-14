@@ -5,6 +5,7 @@ import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {ICurve} from "./bonding-curves/ICurve.sol";
 import {LSSVMPair} from "./LSSVMPair.sol";
 import {ILSSVMPairFactoryLike} from "./ILSSVMPairFactoryLike.sol";
+import {CurveErrorCodes} from "./bonding-curves/CurveErrorCodes.sol";
 
 /// @title An NFT/Token pair with a price (and liquidity?) oracle
 /// @notice This inherits from the base contract to include an oracle
@@ -64,12 +65,13 @@ abstract contract LSSVMPairWithOracle is LSSVMPair {
             );
         }
 
-        // TODO: optimistically write last price to historical observations
-        _writeObservationToOracle();
-
         // Call bonding curve for pricing information
+        // @dev uses calculate buy info + update to also write to oracle
         uint256 protocolFee;
-        (protocolFee, inputAmount) = _calculateBuyInfoAndUpdatePoolParams(
+        (
+            protocolFee,
+            inputAmount
+        ) = _calculateBuyInfoAndUpdatePoolParamsWithOracle(
             numNFTs,
             maxExpectedTokenInput,
             _bondingCurve,
@@ -135,12 +137,12 @@ abstract contract LSSVMPairWithOracle is LSSVMPair {
             require((nftIds.length > 0), "Must ask for > 0 NFTs");
         }
 
-        // TODO: optimistically write last price to historical observations
-        _writeObservationToOracle();
-
         // Call bonding curve for pricing information
         uint256 protocolFee;
-        (protocolFee, inputAmount) = _calculateBuyInfoAndUpdatePoolParams(
+        (
+            protocolFee,
+            inputAmount
+        ) = _calculateBuyInfoAndUpdatePoolParamsWithOracle(
             nftIds.length,
             maxExpectedTokenInput,
             _bondingCurve,
@@ -197,12 +199,12 @@ abstract contract LSSVMPairWithOracle is LSSVMPair {
             require(nftIds.length > 0, "Must ask for > 0 NFTs");
         }
 
-        // TODO: optimistically write last price to historical observations
-        _writeObservationToOracle();
-
         // Call bonding curve for pricing information
         uint256 protocolFee;
-        (protocolFee, outputAmount) = _calculateSellInfoAndUpdatePoolParams(
+        (
+            protocolFee,
+            outputAmount
+        ) = _calculateSellInfoAndUpdatePoolParamsWithOracle(
             nftIds.length,
             minExpectedTokenOutput,
             _bondingCurve,
@@ -219,12 +221,140 @@ abstract contract LSSVMPairWithOracle is LSSVMPair {
     }
 
     /**
-     * Internal functions
+        @notice Calculates the amount needed to be sent into the pair for a buy and adjusts spot price or delta if necessary
+        @dev Optimistically writes to oracle if price has changed
+        @param numNFTs The amount of NFTs to purchase from the pair
+        @param maxExpectedTokenInput The maximum acceptable cost from the sender. If the actual
+        amount is greater than this value, the transaction will be reverted.
+        @param protocolFee The percentage of protocol fee to be taken, as a percentage
+        @return protocolFee The amount of tokens to send as protocol fee
+        @return inputAmount The amount of tokens total tokens receive
      */
+    function _calculateBuyInfoAndUpdatePoolParamsWithOracle(
+        uint256 numNFTs,
+        uint256 maxExpectedTokenInput,
+        ICurve _bondingCurve,
+        ILSSVMPairFactoryLike _factory
+    ) internal returns (uint256 protocolFee, uint256 inputAmount) {
+        CurveErrorCodes.Error error;
+        // Save on 2 SLOADs by caching
+        uint128 currentSpotPrice = spotPrice;
+        uint128 newSpotPrice;
+        uint128 currentDelta = delta;
+        uint128 newDelta;
+        (
+            error,
+            newSpotPrice,
+            newDelta,
+            inputAmount,
+            protocolFee
+        ) = _bondingCurve.getBuyInfo(
+            currentSpotPrice,
+            currentDelta,
+            numNFTs,
+            fee,
+            _factory.protocolFeeMultiplier()
+        );
+
+        // Revert if bonding curve had an error
+        if (error != CurveErrorCodes.Error.OK) {
+            revert BondingCurveError(error);
+        }
+
+        // Revert if input is more than expected
+        require(inputAmount <= maxExpectedTokenInput, "In too many tokens");
+
+        // Consolidate writes to save gas
+        if (currentSpotPrice != newSpotPrice || currentDelta != newDelta) {
+            spotPrice = newSpotPrice;
+            delta = newDelta;
+        }
+
+        // Emit spot price update if it has been updated and write last price
+        // observation to oracle
+        if (currentSpotPrice != newSpotPrice) {
+            // use spotPrice prior to swap to write to observations
+            _writeObservationToOracle(currentSpotPrice);
+
+            // emit update event
+            emit SpotPriceUpdate(newSpotPrice);
+        }
+
+        // Emit delta update if it has been updated
+        if (currentDelta != newDelta) {
+            emit DeltaUpdate(newDelta);
+        }
+    }
+
+    /**
+        @notice Calculates the amount needed to be sent by the pair for a sell and adjusts spot price or delta if necessary
+        @dev Optimistically writes to oracle if price has changed
+        @param numNFTs The amount of NFTs to send to the the pair
+        @param minExpectedTokenOutput The minimum acceptable token received by the sender. If the actual
+        amount is less than this value, the transaction will be reverted.
+        @param protocolFee The percentage of protocol fee to be taken, as a percentage
+        @return protocolFee The amount of tokens to send as protocol fee
+        @return outputAmount The amount of tokens total tokens receive
+     */
+    function _calculateSellInfoAndUpdatePoolParamsWithOracle(
+        uint256 numNFTs,
+        uint256 minExpectedTokenOutput,
+        ICurve _bondingCurve,
+        ILSSVMPairFactoryLike _factory
+    ) internal returns (uint256 protocolFee, uint256 outputAmount) {
+        CurveErrorCodes.Error error;
+        // Save on 2 SLOADs by caching
+        uint128 currentSpotPrice = spotPrice;
+        uint128 newSpotPrice;
+        uint128 currentDelta = delta;
+        uint128 newDelta;
+        (
+            error,
+            newSpotPrice,
+            newDelta,
+            outputAmount,
+            protocolFee
+        ) = _bondingCurve.getSellInfo(
+            currentSpotPrice,
+            currentDelta,
+            numNFTs,
+            fee,
+            _factory.protocolFeeMultiplier()
+        );
+
+        // Revert if bonding curve had an error
+        if (error != CurveErrorCodes.Error.OK) {
+            revert BondingCurveError(error);
+        }
+
+        // Revert if output is too little
+        require(
+            outputAmount >= minExpectedTokenOutput,
+            "Out too little tokens"
+        );
+
+        // Consolidate writes to save gas
+        if (currentSpotPrice != newSpotPrice || currentDelta != newDelta) {
+            spotPrice = newSpotPrice;
+            delta = newDelta;
+        }
+
+        // Emit spot price update if it has been updated and write last price
+        // observation to oracle
+        if (currentSpotPrice != newSpotPrice) {
+            // use spotPrice prior to swap to write to observations
+            _writeObservationToOracle(currentSpotPrice);
+
+            // emit update event
+            emit SpotPriceUpdate(newSpotPrice);
+        }
+
+        // Emit delta update if it has been updated
+        if (currentDelta != newDelta) {
+            emit DeltaUpdate(newDelta);
+        }
+    }
 
     /// @notice Writes an observation of the last price to the oracle prior to swap execution.
-    function _writeObservationToOracle() internal {
-        // TODO: implement ...
-        uint128 currentSpotPrice = spotPrice;
-    }
+    function _writeObservationToOracle(uint128 spotPrice) internal {}
 }
